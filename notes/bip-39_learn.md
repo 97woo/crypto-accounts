@@ -49,3 +49,77 @@ ENT를 SHA-256 해시하고, 그 해시의 **앞 4비트(=ENT/32)**를 체크섬
 이렇게 얻은 132비트를 11비트씩 쪼갠다 → 12개 조각
 
 각 11비트 조각(0~2047)을 단어목록 인덱스로 바꿔 단어를 고른다
+
+## bip-39.rs 핵심 정리
+
+### 1) `MnemonicType` enum (도메인 규칙을 타입으로 고정)
+
+- `Words12` / `Words24` **두 경우만 허용** → 잘못된 입력(예: 15단어)을 타입 단계에서 차단
+- `impl MnemonicType`는 사실상 **규칙표(lookup table)** 역할
+  - Words12 → entropy **16 bytes(128 bits)**, checksum **4 bits**, words **12**
+  - Words24 → entropy **32 bytes(256 bits)**, checksum **8 bits**, words **24**
+
+---
+
+### 2) Wordlist 포함과 파싱
+
+- `include_str!`로 워드리스트 텍스트 파일을 **컴파일 타임에 바이너리에 포함**
+- `parse_wordlist(wordlist: &str) -> Vec<&str>`
+  - 입력 `&str`: 워드리스트 **전체 텍스트(2048줄)**
+  - 출력 `Vec<&str>`: 각 줄을 **복사하지 않고 참조(&str)로 쪼갠 리스트**
+  - 참고: 단어 사본을 만들려면 `Vec<String>`이 필요함
+
+---
+
+### 3) 엔트로피 생성 (`generate_entropy`)
+
+- `Vec<u8>`를 길이 `16/32`로 만들고 `thread_rng().fill_bytes(&mut entropy)`로 **랜덤 바이트 채움**
+- `&mut`가 필요한 이유: 함수가 `entropy` 내용을 **수정**해야 하기 때문
+
+---
+
+### 4) 체크섬 계산 (`calculate_checksum`)
+
+- BIP-39 공식: `checksum_bits = ENT / 32`
+- 코드에서는 바이트 기준으로:
+  - `checksum_bits = entropy.len() / 4`
+  - 이유: `ENT = bytes * 8` 이므로 `ENT/32 = (bytes*8)/32 = bytes/4`
+- 체크섬 추출:
+  - `hash = SHA256(entropy)`
+  - `hash[0] >> (8 - checksum_bits)`로 **해시 첫 바이트의 상위 N비트(MSB)를 추출**
+
+---
+
+### 5) 엔트로피+체크섬 → 11비트 인덱스 (`entropy_to_indices`)
+
+#### (1) 비트열 만들기
+
+- 엔트로피 각 바이트를 **MSB → LSB** 순서로 `Vec<bool>`에 펼침
+- 체크섬 비트도 **MSB → LSB**로 뒤에 이어붙임
+- 순서가 뒤집히면 11비트 묶음의 **자리값(2의 거듭제곱)**이 바뀌어 인덱스가 통째로 달라짐(테스트 벡터 깨짐)
+
+#### (2) 11비트씩 숫자로 조립
+
+- 11비트 덩어리를 다음 규칙으로 숫자 `index`로 조립:
+  - `index = index * 2 + bit`  (코드에선 `<<= 1` 후 `|= 1`)
+- 11비트 최대 값은 `2^11 - 1 = 2047` → `u8(255)`로는 부족해서 **`u16` 사용**
+
+---
+
+### 6) 인덱스 → 니모닉 문장 (`indices_to_mnemonic`)
+
+- `wordlist[idx as usize]`로 단어 선택
+  - 이유: 러스트에서 슬라이스/배열 인덱싱은 **`usize`** 타입을 요구
+- 선택된 단어들을 `" "`로 `join`해서 니모닉 문자열 생성
+
+---
+
+### 7) 니모닉 → 시드 (`mnemonic_to_seed`)
+
+- PBKDF2-HMAC-SHA512:
+  - `pbkdf2_hmac::<Sha512>(...)`
+  - `::<Sha512>`는 **제네릭 타입 인자**로, “HMAC에 SHA512를 써라(알고리즘 고정)” 의미
+  - 장점: 컴파일 타임 확정(런타임 분기/오타 감소), 타입 제약으로 안전
+- salt 규칙:
+  - `salt = "mnemonic" + passphrase`
+  - passphrase가 달라지면 seed도 달라짐
